@@ -14,7 +14,7 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=loggin
 log = logging.getLogger(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-TOKEN           = "8904416244:AAGifcDXuzMHtumaDwFZ7Q4pZHQp-8Ki0rE"
+TOKEN           = "8904416244:AAHZDW-82p1N9wW7d_ybtjfCLDXdhVkFfXs"
 REFERRAL_REWARD = Decimal("1.00")
 
 # ── ESTADO EM MEMÓRIA ─────────────────────────────────────────────────────────
