@@ -24,8 +24,80 @@ _rearn: dict[int, Decimal] = {}
 _tdone: dict[int, set]     = {}
 _twait: dict[int, int]     = {}
 _purch: dict[int, set]     = {}
-_uinfo: dict[int, dict]    = {}
-_ulang: dict[int, str]     = {}   # user language preference
+_uinfo: dict[int, dict]    = {}   # {uid: {username, full_name, negocio}}
+_ulang: dict[int, str]     = {}
+_onboard: set[int]         = {}   # uids que já completaram onboarding
+
+# ─────────────────────────────────────────────
+#  Simulador de actividade em tempo real
+#  A cada 10s: +1 membro fictício entra pelo
+#  referral do prospect E compra o produto mais
+#  barato — o saldo acumula no balance real.
+# ─────────────────────────────────────────────
+
+_FAKE_NAMES = [
+    "Carlos Silva","Ana Ferreira","Bruno Costa","Mariana Souza","Pedro Alves",
+    "Juliana Lima","Ricardo Gomes","Fernanda Rocha","Thiago Martins","Camila Dias",
+    "Lucas Pereira","Beatriz Nunes","Gabriel Carvalho","Larissa Mendes","Rafael Torres",
+    "Priya Sharma","Mohammed Al-Rashid","Wei Zhang","Sofia Müller","Amara Diallo",
+    "Yuki Tanaka","Isabella Rossi","Alejandro García","Fatima Hassan","Kwame Osei",
+]
+import random, itertools
+_name_cycle: dict[int, itertools.cycle] = {}   # uid → ciclo de nomes
+
+# uid → asyncio.Task do simulador
+_sim_tasks: dict[int, asyncio.Task] = {}
+
+async def _simulador(uid: int, bot):
+    """Corre em background: a cada 10s injeta 1 membro + 1 compra."""
+    global _rcnt, _rearn
+    cycle = _name_cycle.setdefault(uid, itertools.cycle(random.sample(_FAKE_NAMES, len(_FAKE_NAMES))))
+    # produto mais barato disponível
+    while True:
+        await asyncio.sleep(10)
+        # escolhe produto mais barato
+        if not PRODUCTS: continue
+        prod = min(PRODUCTS, key=lambda p: p["price"])
+        nome = next(cycle)
+        fake_uid = -(abs(hash(f"{uid}:{nome}")) % 10_000_000)  # uid fictício negativo
+
+        # registar como referral do prospect
+        _uinfo[fake_uid]  = {"username": None, "full_name": nome, "negocio": ""}
+        _rcnt[uid]        = _rcnt.get(uid, 0) + 1
+        earn_ref          = REFERRAL_REWARD
+        _rearn[uid]       = _rearn.get(uid, Decimal("0")) + earn_ref
+        credit(uid, earn_ref, "referral", f"👥 {nome} entrou")
+
+        # fake compra o produto — receita vai para o prospect
+        receita_venda = prod["price"] * Decimal("0.30")   # 30% de comissão demo
+        credit(uid, receita_venda, "purchase", f"🛍️ {nome} comprou {prod['title'][:20]}")
+
+        # notificação push ao prospect
+        membros  = 1 + _rcnt.get(uid, 0) * 3 + len(_tdone.get(uid, set())) * 2
+        b        = bal(uid)
+        negocio  = _uinfo.get(uid, {}).get("negocio", "o teu bot")
+        try:
+            await bot.send_message(
+                uid,
+                f"🔔 <b>Actividade no {negocio} Bot!</b>\n\n"
+                f"👤 <b>{nome}</b> entrou pelo teu link\n"
+                f"🛍️ Comprou <b>{prod['title'][:30]}</b>\n"
+                f"💰 <b>+{earn_ref + receita_venda:.2f} USDT</b> creditados\n\n"
+                f"📊 Total de membros: <b>{membros}</b> · Saldo: <b>{b:.2f} USDT</b>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Ver painel", callback_data="demo:main")],
+                    [InlineKeyboardButton("🚀 Quero o bot real →", url="https://t.me/SAARS_vBOT")],
+                ])
+            )
+        except Exception:
+            pass   # user bloqueou o bot ou saiu
+
+def _start_sim(uid: int, bot):
+    """Inicia o simulador para um uid, cancelando qualquer um anterior."""
+    if uid in _sim_tasks and not _sim_tasks[uid].done():
+        _sim_tasks[uid].cancel()
+    _sim_tasks[uid] = asyncio.create_task(_simulador(uid, bot))
 
 # ─────────────────────────────────────────────
 #  N18N — 10 most spoken languages
@@ -246,7 +318,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "already_bought": "✅ 已购买。",
         "insufficient": "❌ <b>余额不足。</b>\n\n您需要 {price} USDT。",
         "purchase_ok": "✅ <b>购买成功！</b>\n\n{delivery}",
-        "crypto_pay": "💳 <b>加密货币支付</b>\n\n产品：{title}\n金额：<b>{price} USDT</b>\n\n{wallets}\n\n⚠️ <i>发送后点击"我已支付"。</i>",
+        "crypto_pay": "💳 <b>加密货币支付</b>\n\n产品：{title}\n金额：<b>{price} USDT</b>\n\n{wallets}\n\n⚠️ <i>发送后点击「我已支付」。</i>",
         "confirmed": "✅ <b>已确认！</b>\n<i>[演示：自动批准]</i>\n\n{delivery}",
         "delivery_title": "📦 <b>交付</b>\n\n{delivery}",
         "tasks_title": "📋 <b>付费任务</b>\n\n💰 您的余额：<b>{bal} USDT</b>\n\n完成任务自动获得奖励：",
@@ -785,28 +857,340 @@ def mbuy(u,pid):   _purch.setdefault(u,set()).add(pid)
 #  Data constants
 # ─────────────────────────────────────────────
 
-TASKS = [
-    {"id":1,"title":"👥 Entrar no canal SAARS News","desc":"Entre no canal e ganhe saldo demo.","reward":Decimal("1.00"),"verif":"auto"},
-    {"id":2,"title":"📸 Enviar screenshot do menu","desc":"Tire um screenshot e envie como comprovante.","reward":Decimal("2.50"),"verif":"manual"},
-    {"id":3,"title":"🐦 Seguir no Twitter/X","desc":"Segue a conta oficial e confirma aqui.","reward":Decimal("1.50"),"verif":"auto"},
+# ── Dados demo pré-carregados ────────────────────────────────────────────
+# Simulam um negócio digital real — o prospect vê o bot "funcionando"
+TASKS: list[dict] = [
+    {"id":1,"title":"📢 Entrar no canal VIP","desc":"Entra no canal exclusivo e recebe acesso antecipado a todos os lançamentos.","reward":Decimal("2.00"),"verif":"auto"},
+    {"id":2,"title":"🐦 Seguir no Instagram","desc":"Segue o perfil oficial e confirma aqui para ganhar o bónus.","reward":Decimal("1.50"),"verif":"auto"},
+    {"id":3,"title":"📸 Enviar comprovante de partilha","desc":"Partilha este bot com 3 amigos e envia o screenshot como prova.","reward":Decimal("5.00"),"verif":"manual"},
+    {"id":4,"title":"🎯 Responder ao quiz de negócios","desc":"Completa o quiz de 3 perguntas sobre empreendedorismo digital.","reward":Decimal("3.00"),"verif":"auto"},
 ]
-PRODUCTS = [
-    {"id":1,"title":"📘 Guia: Monetizar no Telegram","desc":"PDF com 50 estratégias para gerar receita com bots.","price":Decimal("5.00"),
-     "delivery":"🎉 <b>Desbloqueado!</b>\n\n• Menu Builder\n• Tarefas pagas\n• Infoprodutos\n• Referral viral\n• Pagamentos crypto\n\n📖 https://t.me/saars_news"},
-    {"id":2,"title":"🎥 Mini-curso: Bots do Zero","desc":"6 vídeos práticos do BotFather ao primeiro pagamento.","price":Decimal("12.00"),
-     "delivery":"🎉 <b>Acesso liberado!</b>\n\n▶️ https://t.me/saars_news\n\n• Aula 1: BotFather\n• Aula 2: Menu Builder\n• Aula 3: Pagamentos\n• Aula 4: Tarefas\n• Aula 5: Referral\n• Aula 6: Deploy"},
-    {"id":3,"title":"🤖 Template SAARS Starter","desc":"Código pronto com menus, loja e referral. Deploy em 5 min.","price":Decimal("20.00"),
-     "delivery":"✅ <b>Template desbloqueado!</b>\n\n📦 https://github.com/orlandodev/saars-starter\n\n• bot.py\n• menu_builder.py\n• schema.sql\n• render.yaml"},
+PRODUCTS: list[dict] = [
+    {"id":1,"title":"⚡ Pack Automação Telegram","desc":"Templates prontos para bots de vendas, suporte e comunidade. Deploy em 10 minutos.","price":Decimal("4.99"),
+     "delivery":"🎉 <b>Acesso liberado!</b>\n\n📦 Pack completo:\n• 5 templates de bot prontos\n• Guia de deploy no Render\n• Grupo VIP de suporte\n\n🔗 Acesso: https://t.me/saars_news\n\n<i>Válido por 365 dias.</i>"},
+    {"id":2,"title":"🎓 Mentoria: Renda com Bots","desc":"6 semanas de mentoria ao vivo. Do zero ao primeiro cliente pagante.","price":Decimal("27.00"),
+     "delivery":"✅ <b>Mentoria confirmada!</b>\n\n📅 Próxima turma: segunda-feira\n💬 Grupo privado: https://t.me/saars_news\n\n<i>Guarda este link — é o teu acesso permanente.</i>"},
+    {"id":3,"title":"🤖 Bot Personalizado (feito pra ti)","desc":"Entregamos o teu bot configurado, com loja, tarefas e referral. Pronto para monetizar.","price":Decimal("97.00"),
+     "delivery":"🚀 <b>Pedido recebido!</b>\n\nA equipa SAARS vai entrar em contacto em até 24h.\n\n📩 Telegram: @saars_suporte\n\n<i>Obrigado pela confiança!</i>"},
 ]
-WALLETS = [
-    {"label":"TON Wallet",     "addr":"UQBWs0GY1YzNT8e2_DEMO_TON_ADDRESS_xxx"},
-    {"label":"BNB Smart Chain","addr":"0xDEMO_BEP20_ADDRESS_xxxxxxxxxxxxxxx"},
-    {"label":"TRON (TRC20)",   "addr":"TDEMO_TRC20_ADDRESS_xxxxxxxxxxxxxxxx"},
+WALLETS: list[dict] = [
+    {"id":1,"label":"💎 TON Wallet",      "addr":"UQBWs0GY1YzNT8e2xSAARS_TON_DEMO"},
+    {"id":2,"label":"💲 USDT TRC20",      "addr":"TSAARS_DEMO_TRC20_xxxxxxxxxxxxxxxxx"},
+    {"id":3,"label":"🔶 BNB Smart Chain", "addr":"0xSAARS_DEMO_BEP20_xxxxxxxxxxxxxxx"},
 ]
-CHANNELS = [
-    {"label":"📢 SAARS Oficial",   "url":"https://t.me/saars_news"},
-    {"label":"💬 SAARS Community", "url":"https://t.me/saars_community"},
+CHANNELS: list[dict] = [
+    {"id":1,"label":"📢 Canal VIP SAARS",    "url":"https://t.me/saars_news"},
+    {"id":2,"label":"💬 Comunidade SAARS",   "url":"https://t.me/saars_community"},
 ]
+
+_next_id: dict[str, int] = {"task": 5, "product": 4, "wallet": 4, "channel": 3}
+
+def _new_id(kind: str) -> int:
+    nid = _next_id[kind]; _next_id[kind] += 1; return nid
+
+# ── FSM: estado de cadastro por usuário ──────────────────────────────────
+# _state[uid] = {"step": str, ...dados parciais...}
+_state: dict[int, dict] = {}
+
+# ─────────────────────────────────────────────
+#  Helpers FSM
+# ─────────────────────────────────────────────
+
+def _cancel_state(uid: int): _state.pop(uid, None)
+
+async def _fsm_reply(u: Update, text: str, kb_rows=None):
+    markup = InlineKeyboardMarkup(kb_rows) if kb_rows else None
+    await u.message.reply_html(text, reply_markup=markup)
+
+# ─────────────────────────────────────────────
+#  Menu Gerir (⚙️) — aberto a todos
+# ─────────────────────────────────────────────
+
+async def gerir(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    await q.edit_message_text(
+        "⚙️ <b>Gerir Conteúdo</b>\n\nO que queres adicionar ou remover?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ Produtos",    callback_data="gerir:produtos")],
+            [InlineKeyboardButton("📋 Tarefas",     callback_data="gerir:tarefas")],
+            [InlineKeyboardButton("💳 Wallets",     callback_data="gerir:wallets")],
+            [InlineKeyboardButton("🔒 Canais Guard",callback_data="gerir:canais")],
+            [InlineKeyboardButton("🔙 Menu",        callback_data="demo:main")],
+        ])
+    )
+
+# ── Produtos ─────────────────────────────────
+
+async def gerir_produtos(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    linhas = [f"<b>⚙️ Produtos cadastrados ({len(PRODUCTS)})</b>\n"]
+    for p in PRODUCTS:
+        linhas.append(f"• [{p['id']}] {p['title']} — {p['price']} USDT")
+    if not PRODUCTS: linhas.append("(nenhum ainda)")
+    rows = [
+        [InlineKeyboardButton("➕ Adicionar produto", callback_data="gerir:add_produto")],
+    ]
+    for p in PRODUCTS:
+        rows.append([InlineKeyboardButton(f"🗑️ Remover [{p['id']}] {p['title'][:25]}", callback_data=f"gerir:del_produto:{p['id']}")])
+    rows.append([InlineKeyboardButton("🔙 Gerir", callback_data="gerir:menu")])
+    await q.edit_message_text("\n".join(linhas), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+async def gerir_add_produto(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    _state[uid] = {"step": "prod_titulo"}
+    await q.edit_message_text(
+        "🛍️ <b>Novo Produto — Passo 1/4</b>\n\nEnvia o <b>título</b> do produto:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]])
+    )
+
+async def gerir_del_produto(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    pid = int(q.data.split(":")[2])
+    global PRODUCTS; PRODUCTS = [p for p in PRODUCTS if p["id"] != pid]
+    await gerir_produtos(u, c)
+
+# ── Tarefas ───────────────────────────────────
+
+async def gerir_tarefas(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    linhas = [f"<b>⚙️ Tarefas cadastradas ({len(TASKS)})</b>\n"]
+    for tk in TASKS:
+        linhas.append(f"• [{tk['id']}] {tk['title']} — +{tk['reward']} USDT ({tk['verif']})")
+    if not TASKS: linhas.append("(nenhuma ainda)")
+    rows = [
+        [InlineKeyboardButton("➕ Adicionar tarefa", callback_data="gerir:add_tarefa")],
+    ]
+    for tk in TASKS:
+        rows.append([InlineKeyboardButton(f"🗑️ Remover [{tk['id']}] {tk['title'][:25]}", callback_data=f"gerir:del_tarefa:{tk['id']}")])
+    rows.append([InlineKeyboardButton("🔙 Gerir", callback_data="gerir:menu")])
+    await q.edit_message_text("\n".join(linhas), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+async def gerir_add_tarefa(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    _state[uid] = {"step": "task_titulo"}
+    await q.edit_message_text(
+        "📋 <b>Nova Tarefa — Passo 1/4</b>\n\nEnvia o <b>título</b> da tarefa:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]])
+    )
+
+async def gerir_del_tarefa(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    tid = int(q.data.split(":")[2])
+    global TASKS; TASKS = [t for t in TASKS if t["id"] != tid]
+    await gerir_tarefas(u, c)
+
+# ── Wallets ───────────────────────────────────
+
+async def gerir_wallets(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    linhas = [f"<b>⚙️ Wallets cadastradas ({len(WALLETS)})</b>\n"]
+    for w in WALLETS:
+        linhas.append(f"• [{w['id']}] {w['label']}: <code>{w['addr'][:20]}…</code>")
+    if not WALLETS: linhas.append("(nenhuma ainda)")
+    rows = [
+        [InlineKeyboardButton("➕ Adicionar wallet", callback_data="gerir:add_wallet")],
+    ]
+    for w in WALLETS:
+        rows.append([InlineKeyboardButton(f"🗑️ Remover [{w['id']}] {w['label']}", callback_data=f"gerir:del_wallet:{w['id']}")])
+    rows.append([InlineKeyboardButton("🔙 Gerir", callback_data="gerir:menu")])
+    await q.edit_message_text("\n".join(linhas), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+async def gerir_add_wallet(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    _state[uid] = {"step": "wallet_label"}
+    await q.edit_message_text(
+        "💳 <b>Nova Wallet — Passo 1/2</b>\n\nEnvia o <b>nome/rede</b> da wallet\n(ex: <i>TON Wallet</i>, <i>TRON TRC20</i>):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]])
+    )
+
+async def gerir_del_wallet(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    wid = int(q.data.split(":")[2])
+    global WALLETS; WALLETS = [w for w in WALLETS if w["id"] != wid]
+    await gerir_wallets(u, c)
+
+# ── Canais Guard ──────────────────────────────
+
+async def gerir_canais(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    linhas = [f"<b>⚙️ Canais Guard cadastrados ({len(CHANNELS)})</b>\n"]
+    for ch in CHANNELS:
+        linhas.append(f"• [{ch['id']}] {ch['label']}: {ch['url']}")
+    if not CHANNELS: linhas.append("(nenhum ainda)")
+    rows = [
+        [InlineKeyboardButton("➕ Adicionar canal", callback_data="gerir:add_canal")],
+    ]
+    for ch in CHANNELS:
+        rows.append([InlineKeyboardButton(f"🗑️ Remover [{ch['id']}] {ch['label']}", callback_data=f"gerir:del_canal:{ch['id']}")])
+    rows.append([InlineKeyboardButton("🔙 Gerir", callback_data="gerir:menu")])
+    await q.edit_message_text("\n".join(linhas), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+async def gerir_add_canal(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    _state[uid] = {"step": "canal_label"}
+    await q.edit_message_text(
+        "🔒 <b>Novo Canal Guard — Passo 1/2</b>\n\nEnvia o <b>nome</b> do canal\n(ex: <i>📢 SAARS News</i>):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]])
+    )
+
+async def gerir_del_canal(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    cid = int(q.data.split(":")[2])
+    global CHANNELS; CHANNELS = [ch for ch in CHANNELS if ch["id"] != cid]
+    await gerir_canais(u, c)
+
+# ── Cancel ────────────────────────────────────
+
+async def gerir_cancel(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    _cancel_state(uid)
+    await gerir(u, c)
+
+# ─────────────────────────────────────────────
+#  FSM — handle_text: intercepta respostas de cadastro
+# ─────────────────────────────────────────────
+
+async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid  = u.effective_user.id
+    text = (u.message.text or "").strip()
+    st   = _state.get(uid)
+    if not st:
+        return  # mensagem fora de contexto, ignora
+
+    step = st["step"]
+
+    # ── Onboarding ────────────────────────────
+    if step == "onboard_negocio":
+        negocio = text[:40]  # limita tamanho
+        _uinfo[uid]["negocio"] = negocio
+        _onboard.add(uid)
+        _cancel_state(uid)
+        # Crédito de boas-vindas para activar o ciclo de ganância
+        credit(uid, Decimal("5.00"), "bonus", "🎁 Bónus de boas-vindas")
+        # Arranca o simulador de actividade em tempo real
+        _start_sim(uid, c.bot)
+        await u.message.reply_html(
+            f"🚀 <b>Bot criado com sucesso!</b>\n\n"
+            f"✅ Nome: <b>{negocio}</b>\n"
+            f"✅ Loja de produtos: <b>activa</b>\n"
+            f"✅ Sistema de tarefas: <b>activo</b>\n"
+            f"✅ Referral viral: <b>activo</b>\n"
+            f"✅ Pagamentos crypto: <b>activo</b>\n\n"
+            f"🎁 <b>+5.00 USDT</b> de bónus de boas-vindas creditados!\n\n"
+            f"👇 Explora o teu painel:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🚀 Abrir painel", callback_data="demo:main")
+            ]])
+        )
+        return
+
+    # ── Produto ──────────────────────────────
+    if step == "prod_titulo":
+        st["titulo"] = text; st["step"] = "prod_desc"
+        await u.message.reply_html(
+            f"🛍️ <b>Novo Produto — Passo 2/4</b>\n\nTítulo: <i>{text}</i>\n\nAgora envia a <b>descrição</b>:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]]))
+
+    elif step == "prod_desc":
+        st["desc"] = text; st["step"] = "prod_preco"
+        await u.message.reply_html(
+            f"🛍️ <b>Novo Produto — Passo 3/4</b>\n\nAgora envia o <b>preço em USDT</b>\n(ex: <i>5.00</i>):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]]))
+
+    elif step == "prod_preco":
+        try:
+            preco = Decimal(text.replace(",", "."))
+        except Exception:
+            await u.message.reply_html("❌ Valor inválido. Envia um número, ex: <code>9.99</code>"); return
+        st["preco"] = preco; st["step"] = "prod_delivery"
+        await u.message.reply_html(
+            f"🛍️ <b>Novo Produto — Passo 4/4</b>\n\nPreço: <i>{preco} USDT</i>\n\nAgora envia o <b>conteúdo de entrega</b>\n(link, texto, código de acesso…):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]]))
+
+    elif step == "prod_delivery":
+        PRODUCTS.append({
+            "id":       _new_id("product"),
+            "title":    st["titulo"],
+            "desc":     st["desc"],
+            "price":    st["preco"],
+            "delivery": text,
+        })
+        _cancel_state(uid)
+        await u.message.reply_html(
+            f"✅ <b>Produto adicionado!</b>\n\n🛍️ {st['titulo']} — {st['preco']} USDT",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Outro produto", callback_data="gerir:add_produto")],
+                [InlineKeyboardButton("🔙 Gerir",         callback_data="gerir:produtos")],
+                [InlineKeyboardButton("🏠 Menu Demo",     callback_data="demo:main")],
+            ]))
+
+    # ── Tarefa ───────────────────────────────
+    elif step == "task_titulo":
+        st["titulo"] = text; st["step"] = "task_desc"
+        await u.message.reply_html(
+            f"📋 <b>Nova Tarefa — Passo 2/4</b>\n\nTítulo: <i>{text}</i>\n\nAgora envia a <b>descrição/instrução</b>:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]]))
+
+    elif step == "task_desc":
+        st["desc"] = text; st["step"] = "task_reward"
+        await u.message.reply_html(
+            "📋 <b>Nova Tarefa — Passo 3/4</b>\n\nAgora envia a <b>recompensa em USDT</b>\n(ex: <i>1.50</i>):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]]))
+
+    elif step == "task_reward":
+        try:
+            reward = Decimal(text.replace(",", "."))
+        except Exception:
+            await u.message.reply_html("❌ Valor inválido. Envia um número, ex: <code>1.50</code>"); return
+        st["reward"] = reward; st["step"] = "task_verif"
+        await u.message.reply_html(
+            "📋 <b>Nova Tarefa — Passo 4/4</b>\n\nTipo de verificação:\n• Envia <b>auto</b> — aprovação instantânea\n• Envia <b>manual</b> — user envia comprovante",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ auto",   callback_data="gerir:task_verif:auto"),
+                 InlineKeyboardButton("📤 manual", callback_data="gerir:task_verif:manual")],
+                [InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")],
+            ]))
+
+    # ── Wallet ───────────────────────────────
+    elif step == "wallet_label":
+        st["label"] = text; st["step"] = "wallet_addr"
+        await u.message.reply_html(
+            f"💳 <b>Nova Wallet — Passo 2/2</b>\n\nRede: <i>{text}</i>\n\nAgora envia o <b>endereço</b> da wallet:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]]))
+
+    elif step == "wallet_addr":
+        WALLETS.append({"id": _new_id("wallet"), "label": st["label"], "addr": text})
+        _cancel_state(uid)
+        await u.message.reply_html(
+            f"✅ <b>Wallet adicionada!</b>\n\n💳 {st['label']}\n<code>{text}</code>",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Outra wallet", callback_data="gerir:add_wallet")],
+                [InlineKeyboardButton("🔙 Gerir",        callback_data="gerir:wallets")],
+                [InlineKeyboardButton("🏠 Menu Demo",    callback_data="demo:main")],
+            ]))
+
+    # ── Canal Guard ──────────────────────────
+    elif step == "canal_label":
+        st["label"] = text; st["step"] = "canal_url"
+        await u.message.reply_html(
+            f"🔒 <b>Novo Canal Guard — Passo 2/2</b>\n\nNome: <i>{text}</i>\n\nAgora envia o <b>link</b> do canal\n(ex: <i>https://t.me/meucanal</i>):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="gerir:cancel")]]))
+
+    elif step == "canal_url":
+        CHANNELS.append({"id": _new_id("channel"), "label": st["label"], "url": text})
+        _cancel_state(uid)
+        await u.message.reply_html(
+            f"✅ <b>Canal adicionado!</b>\n\n🔒 {st['label']}\n{text}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Outro canal", callback_data="gerir:add_canal")],
+                [InlineKeyboardButton("🔙 Gerir",       callback_data="gerir:canais")],
+                [InlineKeyboardButton("🏠 Menu Demo",   callback_data="demo:main")],
+            ]))
 
 # ─────────────────────────────────────────────
 #  Handlers
@@ -814,18 +1198,36 @@ CHANNELS = [
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     user = u.effective_user
-    _uinfo[user.id] = {"username": user.username, "full_name": user.full_name}
+    uid  = user.id
+    _uinfo.setdefault(uid, {})
+    _uinfo[uid].update({"username": user.username, "full_name": user.full_name})
     for arg in (c.args or []):
         if arg.startswith("demo_ref_"):
             try: await proc_ref(c, user, int(arg[9:]))
             except: pass
-    lang = get_lang(user.id, user.language_code)
-    _ulang.setdefault(user.id, lang)   # store detected lang if not set
+    lang = get_lang(uid, user.language_code)
+    _ulang.setdefault(uid, lang)
+
+    # Se já fez onboarding, vai directo ao menu
+    if uid in _onboard:
+        negocio = _uinfo[uid].get("negocio", "o teu negócio")
+        await u.message.reply_html(
+            f"👋 Bem-vindo de volta, <b>{user.first_name}</b>!\n\n"
+            f"O teu bot <b>{negocio}</b> está pronto. 🚀",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🚀 Abrir painel", callback_data="demo:main")
+            ]])
+        )
+        return
+
+    # Primeiro acesso — pede o nome do negócio
+    _state[uid] = {"step": "onboard_negocio"}
     await u.message.reply_html(
-        t(user.id, "welcome", name=user.first_name),
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(t(user.id, "open_demo"), callback_data="demo:main")
-        ]])
+        f"👋 Olá, <b>{user.first_name}</b>!\n\n"
+        "Vou criar um <b>bot de demonstração</b> personalizado para ti agora mesmo.\n\n"
+        "⚡ Leva 10 segundos.\n\n"
+        "👇 <b>Qual é o nome do teu negócio ou projecto?</b>\n"
+        "<i>(ex: Minha Loja Digital, Curso do João, CriptoClub...)</i>"
     )
 
 async def cmd_lang(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -854,15 +1256,34 @@ def _mkb(uid):
         [(t(uid,"btn_ref"),"demo:ref"),            (t(uid,"btn_balance"),"demo:saldo")],
         [(t(uid,"btn_guard"),"demo:guard"),        (t(uid,"btn_wallets"),"demo:wallets")],
         [(t(uid,"btn_about"),"demo:sobre"),        (t(uid,"btn_lang"),"demo:lang")],
+        [("⚙️ Gerir Conteúdo","gerir:menu")],
         [(t(uid,"btn_close"),"demo:fechar")],
     )
 
 async def main_menu(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     uid = u.effective_user.id; b = bal(uid)
-    txt = t(uid, "main_title") + "\n\n"
-    if b > 0: txt += t(uid, "balance_line", bal=f"{b:.2f}") + "\n\n"
-    txt += t(uid, "choose_section")
+    negocio = _uinfo.get(uid, {}).get("negocio", "O teu negócio")
+
+    membros  = 1 + _rcnt.get(uid, 0) * 3 + len(_tdone.get(uid, set())) * 2
+    vendas   = len(_purch.get(uid, set())) + _rcnt.get(uid, 0)  # próprias + fictícias
+    proj_dia = b * Decimal("2") if b > 0 else Decimal("0")
+    proj_mes = b * Decimal("60") if b > 0 else Decimal("0")
+
+    txt  = f"🤖 <b>{negocio} Bot</b>\n"
+    txt += f"<i>powered by SAARS</i>\n"
+    txt += f"━━━━━━━━━━━━━━━━\n"
+    txt += f"👥 Membros activos: <b>{membros}</b>\n"
+    txt += f"🛍️ Vendas processadas: <b>{vendas}</b>\n"
+    txt += f"💰 Saldo acumulado: <b>{b:.2f} USDT</b>\n"
+    if proj_mes > 0:
+        txt += f"━━━━━━━━━━━━━━━━\n"
+        txt += f"📈 Projecção diária: <b>~{proj_dia:.0f} USDT</b>\n"
+        txt += f"🚀 Projecção mensal: <b>~{proj_mes:.0f} USDT</b>\n"
+    txt += f"━━━━━━━━━━━━━━━━\n"
+    txt += f"⚡ <i>O bot está a trabalhar em tempo real.</i>\n"
+    txt += f"\n👇 O que queres fazer?"
+
     await q.edit_message_text(txt, parse_mode="HTML", reply_markup=_mkb(uid))
 
 async def lang_menu(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -874,16 +1295,59 @@ async def lang_menu(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def sobre(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id
-    await q.edit_message_text(t(uid,"about_text"), parse_mode="HTML",
-        reply_markup=kb([(t(uid,"btn_menu"),"demo:main")]))
+    negocio = _uinfo.get(uid, {}).get("negocio", "o teu negócio")
+    await q.edit_message_text(
+        f"💡 <b>O que acabaste de ver é o teu bot.</b>\n\n"
+        f"<b>{negocio} Bot</b> com loja, tarefas pagas, referral viral e pagamentos crypto — "
+        f"tudo configurado, tudo automático.\n\n"
+        f"<b>O SAARS entrega isto em menos de 5 minutos.</b>\n\n"
+        f"<b>Inclui:</b>\n"
+        f"• 🛍️ Loja com entrega automática\n"
+        f"• 📋 Tarefas pagas com verificação\n"
+        f"• 👥 Referral viral com ranking\n"
+        f"• 💰 Carteira interna USDT\n"
+        f"• 🔒 Canal Guard\n"
+        f"• 💳 Crypto: TON · TRC20 · BEP20 · SOL\n"
+        f"• 🌐 10 idiomas automáticos\n\n"
+        f"<b>Plano Pro: $20/mês.</b> Sem taxa de setup.\n\n"
+        f"👇 O teu bot está à espera:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Activar o meu bot →", url="https://t.me/SAARS_vBOT")],
+            [InlineKeyboardButton("🔙 Voltar ao demo",       callback_data="demo:main")],
+        ])
+    )
 
 async def fechar(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id
-    await q.edit_message_text(t(uid,"closed"),
-        reply_markup=kb([(t(uid,"btn_reopen"),"demo:main")]))
+    negocio = _uinfo.get(uid, {}).get("negocio", "o teu negócio")
+    b = bal(uid)
+    vendas  = len(_purch.get(uid, set()))
+    membros = 1 + _rcnt.get(uid, 0) * 3 + len(_tdone.get(uid, set())) * 2
+    await q.edit_message_text(
+        f"⏸️ <b>Demo pausado.</b>\n\n"
+        f"O teu bot <b>{negocio}</b> gerou:\n"
+        f"💰 <b>{b:.2f} USDT</b> em saldo\n"
+        f"🛍️ <b>{vendas}</b> vendas\n"
+        f"👥 <b>{membros}</b> membros\n\n"
+        f"🔴 <b>Isto foi só o demo.</b>\n"
+        f"No bot real, estes números são dinheiro real.\n\n"
+        f"👇 Activa o teu bot agora por <b>$20/mês</b>:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Quero o meu bot real →", url="https://t.me/SAARS_vBOT")],
+            [InlineKeyboardButton("🔙 Continuar o demo",        callback_data="demo:main")],
+        ])
+    )
 
 async def loja(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id; b = bal(uid)
+    if not PRODUCTS:
+        await q.edit_message_text(
+            "🛍️ <b>Loja</b>\n\nNenhum produto cadastrado ainda.\nUsa ⚙️ Gerir para adicionar produtos.",
+            parse_mode="HTML",
+            reply_markup=kb([("⚙️ Gerir","gerir:produtos"),(t(uid,"btn_menu"),"demo:main")])
+        ); return
     rows = []
     for p in PRODUCTS:
         ok = bought(uid, p["id"])
@@ -925,14 +1389,31 @@ async def buybal(u: Update, c: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb([(t(uid,"btn_tasks_go"),"demo:tarefas")],[(t(uid,"btn_back_store"),"demo:loja")])
         )
     mbuy(uid, pid)
-    await q.edit_message_text(t(uid,"purchase_ok",delivery=p["delivery"]), parse_mode="HTML",
-        reply_markup=kb([(t(uid,"btn_back_store"),"demo:loja")]))
+    negocio = _uinfo.get(uid, {}).get("negocio", "o teu bot")
+    primeira = len(_purch.get(uid, set())) == 1
+    txt = t(uid,"purchase_ok",delivery=p["delivery"])
+    if primeira:
+        txt += (
+            f"\n\n━━━━━━━━━━━━━━━━\n"
+            f"🤯 <b>Acabaste de fazer a tua primeira venda.</b>\n\n"
+            f"No bot real do <b>{negocio}</b>, este dinheiro é teu.\n"
+            f"Automático. Sem esforço. 24/7.\n\n"
+            f"👇 Activa por <b>$20/mês</b>:"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Quero o meu bot real →", url="https://t.me/SAARS_vBOT")],
+            [InlineKeyboardButton("🔙 Continuar o demo",        callback_data="demo:loja")],
+        ])
+    else:
+        markup = kb([(t(uid,"btn_back_store"),"demo:loja")])
+    await q.edit_message_text(txt, parse_mode="HTML", reply_markup=markup)
 
 async def buycrypto(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id
     pid = int(q.data.split(":")[1])
     p = next(x for x in PRODUCTS if x["id"]==pid)
     wt = "\n".join(f"• <b>{w['label']}</b>:\n  <code>{w['addr']}</code>" for w in WALLETS)
+    if not wt: wt = "<i>Nenhuma wallet configurada ainda.</i>"
     await q.edit_message_text(
         t(uid,"crypto_pay", title=p["title"], price=p["price"], wallets=wt),
         parse_mode="HTML",
@@ -944,8 +1425,24 @@ async def confirm(u: Update, c: ContextTypes.DEFAULT_TYPE):
     pid = int(q.data.split(":")[1])
     p = next(x for x in PRODUCTS if x["id"]==pid)
     mbuy(uid, pid)
-    await q.edit_message_text(t(uid,"confirmed",delivery=p["delivery"]), parse_mode="HTML",
-        reply_markup=kb([(t(uid,"btn_back_store"),"demo:loja")]))
+    negocio = _uinfo.get(uid, {}).get("negocio", "o teu bot")
+    primeira = len(_purch.get(uid, set())) == 1
+    txt = t(uid,"confirmed",delivery=p["delivery"])
+    if primeira:
+        txt += (
+            f"\n\n━━━━━━━━━━━━━━━━\n"
+            f"🤯 <b>Acabaste de fazer a tua primeira venda.</b>\n\n"
+            f"No bot real do <b>{negocio}</b>, este dinheiro é teu.\n"
+            f"Automático. Sem esforço. 24/7.\n\n"
+            f"👇 Activa por <b>$20/mês</b>:"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Quero o meu bot real →", url="https://t.me/SAARS_vBOT")],
+            [InlineKeyboardButton("🔙 Continuar o demo",        callback_data="demo:loja")],
+        ])
+    else:
+        markup = kb([(t(uid,"btn_back_store"),"demo:loja")])
+    await q.edit_message_text(txt, parse_mode="HTML", reply_markup=markup)
 
 async def redeliver(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id
@@ -956,6 +1453,12 @@ async def redeliver(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def tarefas(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id; b = bal(uid)
+    if not TASKS:
+        await q.edit_message_text(
+            "📋 <b>Tarefas</b>\n\nNenhuma tarefa cadastrada ainda.\nUsa ⚙️ Gerir para adicionar tarefas.",
+            parse_mode="HTML",
+            reply_markup=kb([("⚙️ Gerir","gerir:tarefas"),(t(uid,"btn_menu"),"demo:main")])
+        ); return
     rows = []
     for tk in TASKS:
         done = tdone(uid, tk["id"])
@@ -1031,29 +1534,50 @@ async def proc_ref(c, user, rid):
 async def ref(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id
     me = await c.bot.get_me()
+    negocio = _uinfo.get(uid, {}).get("negocio", "o teu bot")
     lnk = f"https://t.me/{me.username}?start=demo_ref_{uid}"
-    cnt = _rcnt.get(uid,0); earn = _rearn.get(uid,Decimal("0"))
+    cnt = _rcnt.get(uid, 0); earn = _rearn.get(uid, Decimal("0"))
+    # Projecção: se tiver 100 refs ao preço real
+    proj = Decimal("100") * REFERRAL_REWARD
     await q.edit_message_text(
-        t(uid,"ref_title",link=lnk,cnt=cnt,earn=f"{earn:.2f}",reward=REFERRAL_REWARD),
+        f"👥 <b>Referral — {negocio}</b>\n\n"
+        f"🔗 Teu link:\n<code>{lnk}</code>\n\n"
+        f"👤 Indicações feitas: <b>{cnt}</b>\n"
+        f"💰 Ganho total: <b>{earn:.2f} USDT</b>\n"
+        f"🎁 Por indicação: <b>{REFERRAL_REWARD} USDT</b>\n\n"
+        f"📈 <i>Com 100 membros indicados → <b>{proj:.0f} USDT</b></i>",
         parse_mode="HTML",
-        reply_markup=kb([(t(uid,"btn_ranking"),"demo:ranking")],[(t(uid,"btn_menu"),"demo:main")])
+        reply_markup=kb(
+            [(t(uid,"btn_ranking"),"demo:ranking")],
+            [(t(uid,"btn_menu"),"demo:main")]
+        )
     )
 
 async def ranking(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id
     top = sorted(_rcnt.items(), key=lambda x:x[1], reverse=True)[:10]
     if not top:
-        txt = t(uid,"ranking_empty")
+        txt = (
+            "🏆 <b>Ranking de Indicações</b>\n\n"
+            "Ainda ninguém indicou membros.\n\n"
+            "<i>No bot real, este ranking é público — "
+            "cria competição e faz os membros indicarem mais.</i>"
+        )
     else:
         medals = ["🥇","🥈","🥉"]+["🔹"]*7
-        lines = [t(uid,"ranking_title")]
+        lines = ["🏆 <b>Top Indicadores</b>\n"]
         for i,(ruid,cnt) in enumerate(top):
             info = _uinfo.get(ruid,{})
             name = f"@{info['username']}" if info.get("username") else info.get("full_name",f"User {ruid}")
             lines.append(t(uid,"ranking_line",medal=medals[i],name=name,cnt=cnt,earn=f"{_rearn.get(ruid,Decimal('0')):.2f}"))
         txt = "\n".join(lines)
-    await q.edit_message_text(txt, parse_mode="HTML",
-        reply_markup=kb([(t(uid,"btn_back_ref"),"demo:ref")]))
+    await q.edit_message_text(
+        txt, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Referral",              callback_data="demo:ref")],
+            [InlineKeyboardButton("🚀 Quero isto no meu bot →", url="https://t.me/SAARS_vBOT")],
+        ])
+    )
 
 async def saldo(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id; b = bal(uid)
@@ -1074,6 +1598,12 @@ async def saldo(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def guard(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    if not CHANNELS:
+        await q.edit_message_text(
+            "🔒 <b>Canal Guard</b>\n\nNenhum canal cadastrado ainda.\nUsa ⚙️ Gerir para adicionar.",
+            parse_mode="HTML",
+            reply_markup=kb([("⚙️ Gerir","gerir:canais"),(t(uid,"btn_menu"),"demo:main")])
+        ); return
     ch = "\n".join(f"• {x['label']}: {x['url']}" for x in CHANNELS)
     rows = [[InlineKeyboardButton(x["label"], url=x["url"])] for x in CHANNELS]
     rows += [
@@ -1090,12 +1620,43 @@ async def guard_ok(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def wallets(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    if not WALLETS:
+        await q.edit_message_text(
+            "💳 <b>Carteiras</b>\n\nNenhuma wallet cadastrada ainda.\nUsa ⚙️ Gerir para adicionar.",
+            parse_mode="HTML",
+            reply_markup=kb([("⚙️ Gerir","gerir:wallets"),(t(uid,"btn_menu"),"demo:main")])
+        ); return
     lines = []
     for w in WALLETS:
         qr = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={quote(w['addr'])}"
         lines.append(f"<b>{w['label']}</b>\n<code>{w['addr']}</code>\n🔗 <a href='{qr}'>Ver QR</a>")
     await q.edit_message_text(t(uid,"wallets_title") + "\n\n".join(lines),
         parse_mode="HTML", reply_markup=kb([(t(uid,"btn_menu"),"demo:main")]), disable_web_page_preview=True)
+
+async def _gerir_task_verif_cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Callback dos botões ⚡auto / 📤manual na criação de tarefa."""
+    q = u.callback_query; await q.answer(); uid = u.effective_user.id
+    verif = q.data.split(":")[2]   # "auto" ou "manual"
+    st = _state.get(uid, {})
+    if st.get("step") != "task_verif":
+        await q.answer("⚠️ Sessão expirada. Começa de novo.", show_alert=True); return
+    TASKS.append({
+        "id":     _new_id("task"),
+        "title":  st["titulo"],
+        "desc":   st["desc"],
+        "reward": st["reward"],
+        "verif":  verif,
+    })
+    _cancel_state(uid)
+    await q.edit_message_text(
+        f"✅ <b>Tarefa adicionada!</b>\n\n📋 {st['titulo']} — +{st['reward']} USDT ({verif})",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Outra tarefa", callback_data="gerir:add_tarefa")],
+            [InlineKeyboardButton("🔙 Gerir",        callback_data="gerir:tarefas")],
+            [InlineKeyboardButton("🏠 Menu Demo",    callback_data="demo:main")],
+        ])
+    )
 
 # ─────────────────────────────────────────────
 #  Router
@@ -1106,13 +1667,30 @@ EXACT = {
     "demo:loja":    loja,      "demo:tarefas": tarefas,  "demo:ref":     ref,
     "demo:ranking": ranking,   "demo:saldo":   saldo,    "demo:guard":   guard,
     "demo:guard_ok":guard_ok,  "demo:wallets": wallets,  "demo:lang":    lang_menu,
+    # ── Gerir ──
+    "gerir:menu":       gerir,
+    "gerir:produtos":   gerir_produtos,
+    "gerir:tarefas":    gerir_tarefas,
+    "gerir:wallets":    gerir_wallets,
+    "gerir:canais":     gerir_canais,
+    "gerir:add_produto":gerir_add_produto,
+    "gerir:add_tarefa": gerir_add_tarefa,
+    "gerir:add_wallet": gerir_add_wallet,
+    "gerir:add_canal":  gerir_add_canal,
+    "gerir:cancel":     gerir_cancel,
 }
 PREFIX = {
-    "pd:":             prod_detail, "demo:buybal:":    buybal,
-    "demo:buycrypto:": buycrypto,   "demo:confirm:":   confirm,
-    "demo:redeliver:": redeliver,   "td:":             task_detail,
-    "demo:tsubmit:":   tsubmit,     "demo:tproof:":    tproof,
-    "setlang:":        set_lang,
+    "pd:":                prod_detail,    "demo:buybal:":    buybal,
+    "demo:buycrypto:":    buycrypto,      "demo:confirm:":   confirm,
+    "demo:redeliver:":    redeliver,      "td:":             task_detail,
+    "demo:tsubmit:":      tsubmit,        "demo:tproof:":    tproof,
+    "setlang:":           set_lang,
+    # ── Gerir prefix ──
+    "gerir:del_produto:": gerir_del_produto,
+    "gerir:del_tarefa:":  gerir_del_tarefa,
+    "gerir:del_wallet:":  gerir_del_wallet,
+    "gerir:del_canal:":   gerir_del_canal,
+    "gerir:task_verif:":  _gerir_task_verif_cb,
 }
 
 async def router(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1144,6 +1722,8 @@ async def run():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("lang",  cmd_lang))
     app.add_handler(CallbackQueryHandler(router))
+    # Texto: FSM de cadastro tem prioridade; proof é fallback
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_proof))
     log.info("🚀 SAARS Demo Bot online — n18n 10 línguas ativas")
     async with app:
